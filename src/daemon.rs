@@ -499,8 +499,10 @@ impl Daemon {
     }
 
     fn getmempoolinfo(&self) -> Result<MempoolInfo> {
-        let info: Value = self.request("getmempoolinfo", json!([]))?;
-        from_value(info).chain_err(|| "invalid mempool info")
+        //let info: Value = self.request("getmempoolinfo", json!([]))?;
+        //from_value(info).chain_err(|| "invalid mempool info")
+
+        Ok(MempoolInfo { loaded: true })
     }
 
     fn getnetworkinfo(&self) -> Result<NetworkInfo> {
