@@ -107,9 +107,20 @@ pub trait ScriptToAddr {
 #[cfg(not(feature = "liquid"))]
 impl ScriptToAddr for bitcoin::Script {
     fn to_address_str(&self, network: Network) -> Option<String> {
-        bitcoin::Address::from_script(self, bitcoin::Network::from(network))
-            .ok()
-            .map(|s| s.to_string())
+        match network {
+            Network::OpnetTestnet => {
+                use bitcoin::address::Address;
+                let hrp = bitcoin::bech32::Hrp::parse_unchecked("opt");
+                Address::from_script(self, bitcoin::address::KnownHrp::from(hrp))
+                    .ok()
+                    .map(|s| s.to_string())
+            }
+            _ => {
+                bitcoin::Address::from_script(self, bitcoin::Network::from(network))
+                    .ok()
+                    .map(|s| s.to_string())
+            }
+        }
     }
 }
 #[cfg(feature = "liquid")]

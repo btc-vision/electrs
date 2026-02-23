@@ -78,6 +78,8 @@ pub enum Network {
     Regtest,
     #[cfg(not(feature = "liquid"))]
     Signet,
+    #[cfg(not(feature = "liquid"))]
+    OpnetTestnet,
 
     #[cfg(feature = "liquid")]
     Liquid,
@@ -100,11 +102,15 @@ pub const LIQUID_TESTNET_PARAMS: address::AddressParams = address::AddressParams
 #[cfg(not(feature = "liquid"))]
 const TESTNET4_MAGIC: u32 = 0x283f161c;
 
+#[cfg(not(feature = "liquid"))]
+const OPNET_TESTNET_MAGIC: u32 = 0x4e7d862a;
+
 impl Network {
     #[cfg(not(feature = "liquid"))]
     pub fn magic(self) -> u32 {
         match self {
             Self::Testnet4 => TESTNET4_MAGIC,
+            Self::OpnetTestnet => OPNET_TESTNET_MAGIC,
             _ => {
                 let magic = BNetwork::from(self).magic();
                 u32::from_le_bytes(magic.to_bytes())
@@ -164,6 +170,7 @@ impl Network {
             "testnet".to_string(),
             "regtest".to_string(),
             "signet".to_string(),
+            "opnet-testnet".to_string(),
         ];
 
         #[cfg(feature = "liquid")]
@@ -192,6 +199,10 @@ pub fn bitcoin_genesis_hash(network: Network) -> bitcoin::BlockHash {
             "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
         )
         .unwrap();
+        static ref OPNET_TESTNET_GENESIS: bitcoin::BlockHash = bitcoin::BlockHash::from_str(
+            "0000017f85106b1feeaf2f70f1e2b805985bb575f88f9b0ba5753d2f3cf13273"
+        )
+        .unwrap();
         static ref REGTEST_GENESIS: bitcoin::BlockHash =
             genesis_block(BNetwork::Regtest).block_hash();
         static ref SIGNET_GENESIS: bitcoin::BlockHash =
@@ -204,6 +215,7 @@ pub fn bitcoin_genesis_hash(network: Network) -> bitcoin::BlockHash {
         Network::Testnet4 => *TESTNET4_GENESIS,
         Network::Regtest => *REGTEST_GENESIS,
         Network::Signet => *SIGNET_GENESIS,
+        Network::OpnetTestnet => *OPNET_TESTNET_GENESIS,
     }
     #[cfg(feature = "liquid")]
     match network {
@@ -248,6 +260,8 @@ impl From<&str> for Network {
             "regtest" => Network::Regtest,
             #[cfg(not(feature = "liquid"))]
             "signet" => Network::Signet,
+            #[cfg(not(feature = "liquid"))]
+            "opnet-testnet" => Network::OpnetTestnet,
 
             #[cfg(feature = "liquid")]
             "liquid" => Network::Liquid,
@@ -270,6 +284,7 @@ impl From<Network> for BNetwork {
             Network::Testnet4 => BNetwork::Testnet4,
             Network::Regtest => BNetwork::Regtest,
             Network::Signet => BNetwork::Signet,
+            Network::OpnetTestnet => BNetwork::Signet,
         }
     }
 }
