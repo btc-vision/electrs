@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 #[cfg(feature = "liquid")]
 use elements::address as elements_address;
 
@@ -109,15 +110,41 @@ impl ScriptToAddr for bitcoin::Script {
     fn to_address_str(&self, network: Network) -> Option<String> {
         match network {
             Network::OpnetTestnet => {
-                use bitcoin::address::Address;
-                let addr = Address::from_script(self, bitcoin::Network::Signet)
-                    .ok()
-                    .map(|a| a.to_string())?;
-                if let Some(stripped) = addr.strip_prefix("tb1") {
-                    Some(format!("opt1{}", stripped))
-                } else {
-                    Some(addr)
+                use bitcoin::bech32::Hrp;
+                use bitcoin::bech32::segwit;
+                use bitcoin::bech32::primitives::gf32::Fe32;
+
+                let bytes = self.as_bytes();
+                // p2wpkh: OP_0 <20 bytes>
+                if bytes.len() == 22 && bytes[0] == 0x00 && bytes[1] == 0x14 {
+                    let hrp = Hrp::parse_unchecked("opt");
+                    return segwit::encode(hrp, Fe32::Q, &bytes[2..]).ok();
                 }
+                // p2wsh: OP_0 <32 bytes>
+                if bytes.len() == 34 && bytes[0] == 0x00 && bytes[1] == 0x20 {
+                    let hrp = Hrp::parse_unchecked("opt");
+                    return segwit::encode(hrp, Fe32::Q, &bytes[2..]).ok();
+                }
+                // p2tr: OP_1 <32 bytes>
+                if bytes.len() == 34 && bytes[0] == 0x51 && bytes[1] == 0x20 {
+                    let hrp = Hrp::parse_unchecked("opt");
+                    return segwit::encode(hrp, Fe32::P, &bytes[2..]).ok();
+                }
+                // segwit v2-v16
+                if bytes.len() >= 4 && bytes[0] >= 0x52 && bytes[0] <= 0x60 {
+                    let version = bytes[0] - 0x50;
+                    let prog_len = bytes[1] as usize;
+                    if bytes.len() == prog_len + 2 {
+                        let hrp = Hrp::parse_unchecked("opt");
+                        if let Ok(ver) = Fe32::try_from(version) {
+                            return segwit::encode(hrp, ver, &bytes[2..]).ok();
+                        }
+                    }
+                }
+                // legacy p2pkh/p2sh fall through to signet encoding (tb1 won't appear, they'll get base58)
+                bitcoin::Address::from_script(self, bitcoin::Network::from(network))
+                    .ok()
+                    .map(|s| s.to_string())
             }
             _ => {
                 bitcoin::Address::from_script(self, bitcoin::Network::from(network))
