@@ -23,7 +23,7 @@ pub struct ScanIterator<'a> {
     done: bool,
 }
 
-impl<'a> Iterator for ScanIterator<'a> {
+impl Iterator for ScanIterator<'_> {
     type Item = DBRow;
 
     fn next(&mut self) -> Option<DBRow> {
@@ -48,7 +48,7 @@ pub struct ReverseScanIterator<'a> {
     done: bool,
 }
 
-impl<'a> Iterator for ReverseScanIterator<'a> {
+impl Iterator for ReverseScanIterator<'_> {
     type Item = DBRow;
 
     fn next(&mut self) -> Option<DBRow> {
@@ -73,6 +73,67 @@ impl<'a> Iterator for ReverseScanIterator<'a> {
     }
 }
 
+pub struct ReverseScanGroupIterator<'a> {
+    iters: Vec<ReverseScanIterator<'a>>,
+    next_rows: Vec<Option<DBRow>>,
+    value_offset: usize,
+    done: bool,
+}
+
+impl<'a> ReverseScanGroupIterator<'a> {
+    pub fn new(
+        mut iters: Vec<ReverseScanIterator<'a>>,
+        value_offset: usize,
+    ) -> ReverseScanGroupIterator<'a> {
+        let mut next_rows: Vec<Option<DBRow>> = Vec::with_capacity(iters.len());
+        for iter in &mut iters {
+            let next = iter.next();
+            next_rows.push(next);
+        }
+        let done = next_rows.iter().all(|row| row.is_none());
+        ReverseScanGroupIterator {
+            iters,
+            next_rows,
+            value_offset,
+            done,
+        }
+    }
+}
+
+impl Iterator for ReverseScanGroupIterator<'_> {
+    type Item = DBRow;
+
+    fn next(&mut self) -> Option<DBRow> {
+        if self.done {
+            return None;
+        }
+
+        let best_index = self
+            .next_rows
+            .iter()
+            .enumerate()
+            .max_by(|(a_index, a_opt), (b_index, b_opt)| match (a_opt, b_opt) {
+                (None, None) => a_index.cmp(b_index),
+
+                (Some(_), None) => std::cmp::Ordering::Greater,
+
+                (None, Some(_)) => std::cmp::Ordering::Less,
+
+                (Some(a), Some(b)) => a.key[self.value_offset..].cmp(&(b.key[self.value_offset..])),
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+
+        let best = self.next_rows[best_index].take();
+        self.next_rows[best_index] = self.iters.get_mut(best_index)?.next();
+        if self.next_rows.iter().all(|row| row.is_none()) {
+            self.done = true;
+        }
+
+        best
+    }
+}
+
 #[derive(Debug)]
 pub struct DB {
     db: rocksdb::DB,
@@ -87,7 +148,7 @@ pub enum DBFlush {
 impl DB {
     pub fn open(path: &Path, config: &Config) -> DB {
         let db = DB {
-            db: open_raw_db(path),
+            db: open_raw_db(path, OpenMode::ReadWrite),
         };
         db.verify_compatibility(config);
         db
@@ -105,11 +166,11 @@ impl DB {
         self.db.set_options(&opts).unwrap();
     }
 
-    pub fn raw_iterator(&self) -> rocksdb::DBRawIterator {
+    pub fn raw_iterator(&self) -> rocksdb::DBRawIterator<'_> {
         self.db.raw_iterator()
     }
 
-    pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator {
+    pub fn iter_scan(&self, prefix: &[u8]) -> ScanIterator<'_> {
         ScanIterator {
             prefix: prefix.to_vec(),
             iter: self.db.prefix_iterator(prefix),
@@ -117,7 +178,7 @@ impl DB {
         }
     }
 
-    pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator {
+    pub fn iter_scan_from(&self, prefix: &[u8], start_at: &[u8]) -> ScanIterator<'_> {
         let iter = self.db.iterator(rocksdb::IteratorMode::From(
             start_at,
             rocksdb::Direction::Forward,
@@ -129,7 +190,7 @@ impl DB {
         }
     }
 
-    pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator {
+    pub fn iter_scan_reverse(&self, prefix: &[u8], prefix_max: &[u8]) -> ReverseScanIterator<'_> {
         let mut iter = self.db.raw_iterator();
         iter.seek_for_prev(prefix_max);
 
@@ -138,6 +199,25 @@ impl DB {
             iter,
             done: false,
         }
+    }
+
+    pub fn iter_scan_group_reverse(
+        &self,
+        prefixes: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
+        value_offset: usize,
+    ) -> ReverseScanGroupIterator<'_> {
+        let iters = prefixes
+            .map(|(prefix, prefix_max)| {
+                let mut iter = self.db.raw_iterator();
+                iter.seek_for_prev(prefix_max);
+                ReverseScanIterator {
+                    prefix: prefix.to_vec(),
+                    iter,
+                    done: false,
+                }
+            })
+            .collect();
+        ReverseScanGroupIterator::new(iters, value_offset)
     }
 
     pub fn write(&self, mut rows: Vec<DBRow>, flush: DBFlush) {
@@ -160,6 +240,15 @@ impl DB {
         opts.set_sync(do_flush);
         opts.disable_wal(!do_flush);
         self.db.write_opt(batch, &opts).unwrap();
+    }
+
+    pub fn delete(&self, keys: Vec<Vec<u8>>) {
+        debug!("deleting {} rows from {:?}", keys.len(), self.db);
+        for key in keys {
+            let _ = self.db.delete(key).inspect_err(|err| {
+                warn!("Error while deleting DB row: {err}");
+            });
+        }
     }
 
     pub fn flush(&self) {
@@ -201,7 +290,17 @@ impl DB {
     }
 }
 
-pub fn open_raw_db<T: rocksdb::ThreadMode>(path: &Path) -> rocksdb::DBWithThreadMode<T> {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum OpenMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub fn open_raw_db<T: rocksdb::ThreadMode>(
+    path: &Path,
+    read_mode: OpenMode,
+) -> rocksdb::DBWithThreadMode<T> {
     debug!("opening DB at {:?}", path);
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
@@ -219,5 +318,13 @@ pub fn open_raw_db<T: rocksdb::ThreadMode>(path: &Path) -> rocksdb::DBWithThread
     // let mut block_opts = rocksdb::BlockBasedOptions::default();
     // block_opts.set_block_size(???);
 
-    rocksdb::DBWithThreadMode::<T>::open(&db_opts, path).expect("failed to open RocksDB")
+    match read_mode {
+        OpenMode::ReadOnly => {
+            rocksdb::DBWithThreadMode::<T>::open_for_read_only(&db_opts, path, false)
+                .expect("failed to open RocksDB (READ ONLY)")
+        }
+        OpenMode::ReadWrite => {
+            rocksdb::DBWithThreadMode::<T>::open(&db_opts, path).expect("failed to open RocksDB")
+        }
+    }
 }

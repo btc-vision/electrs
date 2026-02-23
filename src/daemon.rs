@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64;
-use bitcoin::hashes::hex::{FromHex, ToHex};
+use bitcoin::hashes::Hash;
 use glob;
 use hex;
 use itertools::Itertools;
@@ -18,6 +19,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use elements::encode::{deserialize, serialize};
 
 use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
+use crate::config::BITCOIND_SUBVER;
 use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
 use crate::signal::Waiter;
 use crate::util::HeaderList;
@@ -26,14 +28,14 @@ use crate::errors::*;
 
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
-    T: FromHex,
+    T: FromStr,
+    <T as FromStr>::Err: std::fmt::Debug,
 {
-    T::from_hex(
-        value
-            .as_str()
-            .chain_err(|| format!("non-string value: {}", value))?,
-    )
-    .chain_err(|| format!("non-hex value: {}", value))
+    value
+        .as_str()
+        .chain_err(|| format!("non-string value: {}", value))?
+        .parse::<T>()
+        .map_err(|e| format!("failed to parse hash: {:?}", e).into())
 }
 
 fn header_from_value(value: Value) -> Result<BlockHeader> {
@@ -135,6 +137,34 @@ pub struct MempoolAcceptResult {
     fees: Option<MempoolFees>,
     #[serde(rename = "reject-reason")]
     reject_reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MempoolFeesSubmitPackage {
+    base: f64,
+    #[serde(rename = "effective-feerate")]
+    effective_feerate: Option<f64>,
+    #[serde(rename = "effective-includes")]
+    effective_includes: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubmitPackageResult {
+    package_msg: String,
+    #[serde(rename = "tx-results")]
+    tx_results: HashMap<String, TxResult>,
+    #[serde(rename = "replaced-transactions")]
+    replaced_transactions: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TxResult {
+    txid: String,
+    #[serde(rename = "other-wtxid")]
+    other_wtxid: Option<String>,
+    vsize: Option<u32>,
+    fees: Option<MempoolFeesSubmitPackage>,
+    error: Option<String>,
 }
 
 pub trait CookieGetter: Send + Sync {
@@ -335,6 +365,9 @@ impl Daemon {
                 network_info.subversion,
             )
         }
+        // Insert the subversion (/Satoshi xx.xx.xx(comment)/) string from bitcoind
+        _ = BITCOIND_SUBVER.set(network_info.subversion);
+
         let blockchain_info = daemon.getblockchaininfo()?;
         info!("{:?}", blockchain_info);
         if blockchain_info.pruned {
@@ -517,7 +550,7 @@ impl Daemon {
     pub fn getblockheader(&self, blockhash: &BlockHash) -> Result<BlockHeader> {
         header_from_value(self.request(
             "getblockheader",
-            json!([blockhash.to_hex(), /*verbose=*/ false]),
+            json!([blockhash.to_string(), /*verbose=*/ false]),
         )?)
     }
 
@@ -536,21 +569,22 @@ impl Daemon {
     }
 
     pub fn getblock(&self, blockhash: &BlockHash) -> Result<Block> {
-        let block = block_from_value(
-            self.request("getblock", json!([blockhash.to_hex(), /*verbose=*/ false]))?,
-        )?;
+        let block = block_from_value(self.request(
+            "getblock",
+            json!([blockhash.to_string(), /*verbose=*/ false]),
+        )?)?;
         assert_eq!(block.block_hash(), *blockhash);
         Ok(block)
     }
 
     pub fn getblock_raw(&self, blockhash: &BlockHash, verbose: u32) -> Result<Value> {
-        self.request("getblock", json!([blockhash.to_hex(), verbose]))
+        self.request("getblock", json!([blockhash.to_string(), verbose]))
     }
 
     pub fn getblocks(&self, blockhashes: &[BlockHash]) -> Result<Vec<Block>> {
         let params_list: Vec<Value> = blockhashes
             .iter()
-            .map(|hash| json!([hash.to_hex(), /*verbose=*/ false]))
+            .map(|hash| json!([hash.to_string(), /*verbose=*/ false]))
             .collect();
         let values = self.requests("getblock", &params_list)?;
         let mut blocks = vec![];
@@ -563,7 +597,7 @@ impl Daemon {
     pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
         let params_list: Vec<Value> = txhashes
             .iter()
-            .map(|txhash| json!([txhash.to_hex(), /*verbose=*/ false]))
+            .map(|txhash| json!([txhash.to_string(), /*verbose=*/ false]))
             .collect();
         let values = self.retry_request_batch("getrawtransaction", &params_list, 0.25)?;
         let mut txs = vec![];
@@ -582,14 +616,14 @@ impl Daemon {
     ) -> Result<Value> {
         self.request(
             "getrawtransaction",
-            json!([txid.to_hex(), verbose, blockhash]),
+            json!([txid.to_string(), verbose, blockhash]),
         )
     }
 
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
         let value = self.request(
             "getrawtransaction",
-            json!([txhash.to_hex(), /*verbose=*/ false]),
+            json!([txhash.to_string(), /*verbose=*/ false]),
         )?;
         tx_from_value(value)
     }
@@ -605,8 +639,10 @@ impl Daemon {
 
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.request("sendrawtransaction", json!([txhex]))?;
-        Txid::from_hex(txid.as_str().chain_err(|| "non-string txid")?)
-            .chain_err(|| "failed to parse txid")
+        txid.as_str()
+            .chain_err(|| "non-string txid")?
+            .parse::<Txid>()
+            .map_err(|e| format!("failed to parse txid: {:?}", e).into())
     }
 
     pub fn test_mempool_accept(
@@ -621,6 +657,25 @@ impl Daemon {
         let result = self.request("testmempoolaccept", params)?;
         serde_json::from_value::<Vec<MempoolAcceptResult>>(result)
             .chain_err(|| "invalid testmempoolaccept reply")
+    }
+
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        let params = match (maxfeerate, maxburnamount) {
+            (Some(rate), Some(burn)) => {
+                json!([txhex, format!("{:.8}", rate), format!("{:.8}", burn)])
+            }
+            (Some(rate), None) => json!([txhex, format!("{:.8}", rate)]),
+            (None, Some(burn)) => json!([txhex, null, format!("{:.8}", burn)]),
+            (None, None) => json!([txhex]),
+        };
+        let result = self.request("submitpackage", params)?;
+        serde_json::from_value::<SubmitPackageResult>(result)
+            .chain_err(|| "invalid submitpackage reply")
     }
 
     // Get estimated feerates for the provided confirmation targets using a batch RPC request
@@ -658,7 +713,7 @@ impl Daemon {
     }
 
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
-        let info: Value = self.request("getblockheader", json!([tip.to_hex()]))?;
+        let info: Value = self.request("getblockheader", json!([tip.to_string()]))?;
         let tip_height = info
             .get("height")
             .expect("missing height")
@@ -674,7 +729,7 @@ impl Daemon {
             result.append(&mut headers);
         }
 
-        let mut blockhash = BlockHash::default();
+        let mut blockhash = BlockHash::all_zeros();
         for header in &result {
             assert_eq!(header.prev_blockhash, blockhash);
             blockhash = header.block_hash();
@@ -700,7 +755,7 @@ impl Daemon {
             bestblockhash,
         );
         let mut new_headers = vec![];
-        let null_hash = BlockHash::default();
+        let null_hash = BlockHash::all_zeros();
         let mut blockhash = *bestblockhash;
         while blockhash != null_hash {
             if indexed_headers.header_by_blockhash(&blockhash).is_some() {

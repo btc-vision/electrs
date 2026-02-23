@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use bitcoin::hashes::{hex::FromHex, sha256, Hash};
+use bitcoin::hashes::{sha256, Hash};
 use elements::confidential::{Asset, Value};
 use elements::encode::{deserialize, serialize};
 use elements::secp256k1_zkp::ZERO_TWEAK;
@@ -11,19 +11,24 @@ use crate::chain::{BNetwork, BlockHash, Network, Txid};
 use crate::elements::peg::{get_pegin_data, get_pegout_data, PeginInfo, PegoutInfo};
 use crate::elements::registry::{AssetMeta, AssetRegistry};
 use crate::errors::*;
-use crate::new_index::schema::{TxHistoryInfo, TxHistoryKey, TxHistoryRow};
+use crate::new_index::schema::{Operation, TxHistoryInfo, TxHistoryKey, TxHistoryRow};
 use crate::new_index::{db::DBFlush, ChainQuery, DBRow, Mempool, Query};
-use crate::util::{bincode_util, full_hash, Bytes, FullHash, TransactionStatus, TxInput};
+use crate::util::{
+    bincode_util, full_hash, Bytes, FullHash, IsProvablyUnspendable, TransactionStatus, TxInput,
+};
 
 lazy_static! {
     pub static ref NATIVE_ASSET_ID: AssetId =
-        AssetId::from_hex("6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d")
+        "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+            .parse()
             .unwrap();
     pub static ref NATIVE_ASSET_ID_TESTNET: AssetId =
-        AssetId::from_hex("144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49")
+        "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49"
+            .parse()
             .unwrap();
     pub static ref NATIVE_ASSET_ID_REGTEST: AssetId =
-        AssetId::from_hex("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225")
+        "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225"
+            .parse()
             .unwrap();
 }
 
@@ -33,6 +38,7 @@ fn parse_asset_id(sl: &[u8]) -> AssetId {
 
 #[derive(Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum LiquidAsset {
     Issued(IssuedAsset),
     Native(PeggedAsset),
@@ -71,9 +77,9 @@ pub struct IssuedAsset {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AssetRow {
     pub issuance_txid: FullHash,
-    pub issuance_vin: u16,
+    pub issuance_vin: u32,
     pub prev_txid: FullHash,
-    pub prev_vout: u16,
+    pub prev_vout: u32,
     pub issuance: Bytes, // bincode does not like dealing with AssetIssuance, deserialization fails with "invalid type: sequence, expected a struct"
     pub reissuance_token: FullHash,
 }
@@ -92,7 +98,7 @@ impl IssuedAsset {
         let reissuance_token = parse_asset_id(&asset.reissuance_token);
 
         let contract_hash = if issuance.asset_entropy != [0u8; 32] {
-            Some(ContractHash::from_inner(issuance.asset_entropy))
+            Some(ContractHash::from_byte_array(issuance.asset_entropy))
         } else {
             None
         };
@@ -105,7 +111,7 @@ impl IssuedAsset {
             },
             issuance_prevout: OutPoint {
                 txid: deserialize(&asset.prev_txid).unwrap(),
-                vout: asset.prev_vout as u32,
+                vout: asset.prev_vout,
             },
             contract_hash,
             reissuance_token,
@@ -155,7 +161,7 @@ impl LiquidAsset {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct IssuingInfo {
     pub txid: FullHash,
-    pub vin: u16,
+    pub vin: u32,
     pub is_reissuance: bool,
     // None for blinded issuances
     pub issued_amount: Option<u64>,
@@ -166,7 +172,7 @@ pub struct IssuingInfo {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct BurningInfo {
     pub txid: FullHash,
-    pub vout: u16,
+    pub vout: u32,
     pub value: u64,
 }
 
@@ -178,11 +184,17 @@ pub fn index_confirmed_tx_assets(
     network: Network,
     parent_network: BNetwork,
     rows: &mut Vec<DBRow>,
+    op: &Operation,
 ) {
     let (history, issuances) = index_tx_assets(tx, network, parent_network);
 
     rows.extend(history.into_iter().map(|(asset_id, info)| {
-        asset_history_row(&asset_id, confirmed_height, tx_position, info).into_row()
+        let history_row = asset_history_row(&asset_id, confirmed_height, tx_position, info);
+        if let Operation::DeleteBlocksWithHistory(tx) = op {
+            tx.send(history_row.key.hash)
+                .expect("unbounded channel won't fail");
+        }
+        history_row.into_row()
     }));
 
     // the initial issuance is kept twice: once in the history index under I<asset><height><txid:vin>,
@@ -204,10 +216,7 @@ pub fn index_mempool_tx_assets(
 ) {
     let (history, issuances) = index_tx_assets(tx, network, parent_network);
     for (asset_id, info) in history {
-        asset_history
-            .entry(asset_id)
-            .or_insert_with(Vec::new)
-            .push(info);
+        asset_history.entry(asset_id).or_default().push(info);
     }
     for (asset_id, issuance) in issuances {
         asset_issuance.insert(asset_id, issuance);
@@ -250,18 +259,18 @@ fn index_tx_assets(
                 pegout.asset.explicit().unwrap(),
                 TxHistoryInfo::Pegout(PegoutInfo {
                     txid,
-                    vout: txo_index as u16,
+                    vout: txo_index as u32,
                     value: pegout.value,
                 }),
             ));
-        } else if txo.script_pubkey.is_provably_unspendable() && !txo.is_fee() {
+        } else if txo.script_pubkey.is_provably_unspendable_() && !txo.is_fee() {
             if let (Asset::Explicit(asset_id), Value::Explicit(value)) = (txo.asset, txo.value) {
                 if value > 0 {
                     history.push((
                         asset_id,
                         TxHistoryInfo::Burning(BurningInfo {
                             txid,
-                            vout: txo_index as u16,
+                            vout: txo_index as u32,
                             value,
                         }),
                     ));
@@ -273,10 +282,10 @@ fn index_tx_assets(
     for (txi_index, txi) in tx.input.iter().enumerate() {
         if let Some(pegin) = get_pegin_data(txi, network) {
             history.push((
-                pegin.asset.explicit().unwrap(),
+                pegin.asset,
                 TxHistoryInfo::Pegin(PeginInfo {
                     txid,
-                    vin: txi_index as u16,
+                    vin: txi_index as u32,
                     value: pegin.value,
                 }),
             ));
@@ -301,7 +310,7 @@ fn index_tx_assets(
                 asset_id,
                 TxHistoryInfo::Issuing(IssuingInfo {
                     txid,
-                    vin: txi_index as u16,
+                    vin: txi_index as u32,
                     is_reissuance,
                     issued_amount,
                     token_amount,
@@ -318,9 +327,9 @@ fn index_tx_assets(
                     asset_id,
                     AssetRow {
                         issuance_txid: txid,
-                        issuance_vin: txi_index as u16,
+                        issuance_vin: txi_index as u32,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
-                        prev_vout: txi.previous_output.vout as u16,
+                        prev_vout: txi.previous_output.vout,
                         issuance: serialize(&txi.asset_issuance),
                         reissuance_token: full_hash(&reissuance_token.into_inner()[..]),
                     },
@@ -386,7 +395,7 @@ pub fn lookup_asset(
     Ok(if let Some(row) = row {
         let reissuance_token = parse_asset_id(&row.reissuance_token);
 
-        let meta = meta.map(Clone::clone).or_else(|| match registry {
+        let meta = meta.cloned().or_else(|| match registry {
             Some(AssetRegistryLock::RwLock(rwlock)) => {
                 rwlock.read().unwrap().get(asset_id).cloned()
             }
@@ -405,7 +414,7 @@ pub fn lookup_asset(
 }
 
 pub fn get_issuance_entropy(txin: &TxIn) -> Result<sha256::Midstate> {
-    if !txin.has_issuance {
+    if !txin.has_issuance() {
         bail!("input has no issuance");
     }
 

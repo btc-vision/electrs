@@ -4,9 +4,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid, TxidCompat};
 use crate::config::Config;
-use crate::daemon::{Daemon, MempoolAcceptResult};
+use crate::daemon::{Daemon, MempoolAcceptResult, SubmitPackageResult};
 use crate::errors::*;
 use crate::new_index::{ChainQuery, Mempool, ScriptStats, SpendingInput, Utxo};
 use crate::util::{is_spendable, BlockId, Bytes, TransactionStatus};
@@ -65,7 +65,7 @@ impl Query {
         self.config.network_type
     }
 
-    pub fn mempool(&self) -> RwLockReadGuard<Mempool> {
+    pub fn mempool(&self) -> RwLockReadGuard<'_, Mempool> {
         self.mempool.read().unwrap()
     }
 
@@ -93,6 +93,15 @@ impl Query {
         maxfeerate: Option<f64>,
     ) -> Result<Vec<MempoolAcceptResult>> {
         self.daemon.test_mempool_accept(txhex, maxfeerate)
+    }
+
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        self.daemon.submit_package(txhex, maxfeerate, maxburnamount)
     }
 
     pub fn utxo(&self, scripthash: &[u8]) -> Result<Vec<Utxo>> {
@@ -152,7 +161,7 @@ impl Query {
     }
 
     pub fn lookup_tx_spends(&self, tx: Transaction) -> Vec<Option<SpendingInput>> {
-        let txid = tx.txid();
+        let txid = tx.get_txid();
 
         tx.output
             .par_iter()

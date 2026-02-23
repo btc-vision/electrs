@@ -12,7 +12,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid, TxidCompat};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -165,7 +165,7 @@ impl Mempool {
             // TODO seek directly to last seen tx without reading earlier rows
             .skip_while(|txid| {
                 // skip until we reach the last_seen_txid
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
+                last_seen_txid.is_some_and(|last_seen_txid| last_seen_txid != txid)
             })
             .skip(match last_seen_txid {
                 Some(_) => 1, // skip the last_seen_txid itself
@@ -175,6 +175,49 @@ impl Mempool {
             .map(|txid| self.txstore.get(&txid).expect("missing mempool tx"))
             .cloned()
             .collect()
+    }
+
+    pub fn history_group(
+        &self,
+        scripthashes: &[[u8; 32]],
+        last_seen_txid: Option<&Txid>,
+        limit: usize,
+    ) -> Vec<Transaction> {
+        let _timer = self
+            .latency
+            .with_label_values(&["history_group"])
+            .start_timer();
+        scripthashes
+            .iter()
+            .filter_map(|scripthash| self.history.get(&scripthash[..]))
+            .flat_map(|entries| entries.iter())
+            .map(|e| e.get_txid())
+            .unique()
+            // TODO seek directly to last seen tx without reading earlier rows
+            .skip_while(|txid| {
+                // skip until we reach the last_seen_txid
+                last_seen_txid.is_some_and(|last_seen_txid| last_seen_txid != txid)
+            })
+            .skip(match last_seen_txid {
+                Some(_) => 1, // skip the last_seen_txid itself
+                None => 0,
+            })
+            .take(limit)
+            .map(|txid| self.txstore.get(&txid).expect("missing mempool tx"))
+            .cloned()
+            .collect()
+    }
+
+    pub fn history_txids_iter_group<'a>(
+        &'a self,
+        scripthashes: &'a [[u8; 32]],
+    ) -> impl Iterator<Item = Txid> + 'a {
+        scripthashes
+            .iter()
+            .filter_map(move |scripthash| self.history.get(&scripthash[..]))
+            .flat_map(|entries| entries.iter())
+            .map(|entry| entry.get_txid())
+            .unique()
     }
 
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<Txid> {
@@ -210,7 +253,7 @@ impl Mempool {
 
                     Some(Utxo {
                         txid: deserialize(&info.txid).expect("invalid txid"),
-                        vout: info.vout as u32,
+                        vout: info.vout,
                         value: info.value,
                         confirmed: None,
 
@@ -344,7 +387,7 @@ impl Mempool {
     }
 
     pub fn unique_txids(&self) -> HashSet<Txid> {
-        return HashSet::from_iter(self.txstore.keys().cloned());
+        HashSet::from_iter(self.txstore.keys().cloned())
     }
 
     pub fn update(mempool: &RwLock<Mempool>, daemon: &Daemon) -> Result<()> {
@@ -407,7 +450,7 @@ impl Mempool {
     }
 
     pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) -> Result<()> {
-        if self.txstore.get(txid).is_none() {
+        if !self.txstore.contains_key(txid) {
             if let Ok(tx) = daemon.getmempooltx(txid) {
                 if self.add(vec![tx]) == 0 {
                     return Err(format!(
@@ -438,7 +481,7 @@ impl Mempool {
         let mut txids = Vec::with_capacity(txs.len());
         // Phase 1: add to txstore
         for tx in txs {
-            let txid = tx.txid();
+            let txid = tx.get_txid();
             // Only push if it doesn't already exist.
             // This is important now that update doesn't lock during
             // the entire function body.
@@ -483,7 +526,10 @@ impl Mempool {
                 fee: feeinfo.fee,
                 vsize: feeinfo.vsize,
                 #[cfg(not(feature = "liquid"))]
-                value: prevouts.values().map(|prevout| prevout.value).sum(),
+                value: prevouts
+                    .values()
+                    .map(|prevout| prevout.value.to_sat())
+                    .sum(),
             });
 
             self.feeinfo.insert(txid, feeinfo);
@@ -491,14 +537,18 @@ impl Mempool {
             // An iterator over (ScriptHash, TxHistoryInfo)
             let spending = prevouts.into_iter().map(|(input_index, prevout)| {
                 let txi = tx.input.get(input_index as usize).unwrap();
+                #[cfg(not(feature = "liquid"))]
+                let value = prevout.value.to_sat();
+                #[cfg(feature = "liquid")]
+                let value = prevout.value;
                 (
                     compute_script_hash(&prevout.script_pubkey),
                     TxHistoryInfo::Spending(SpendingInfo {
                         txid: txid_bytes,
-                        vin: input_index as u16,
+                        vin: input_index,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
-                        prev_vout: txi.previous_output.vout as u16,
-                        value: prevout.value,
+                        prev_vout: txi.previous_output.vout,
+                        value,
                     }),
                 )
             });
@@ -512,22 +562,23 @@ impl Mempool {
                 .enumerate()
                 .filter(|(_, txo)| is_spendable(txo) || config.index_unspendables)
                 .map(|(index, txo)| {
+                    #[cfg(not(feature = "liquid"))]
+                    let value = txo.value.to_sat();
+                    #[cfg(feature = "liquid")]
+                    let value = txo.value;
                     (
                         compute_script_hash(&txo.script_pubkey),
                         TxHistoryInfo::Funding(FundingInfo {
                             txid: txid_bytes,
-                            vout: index as u16,
-                            value: txo.value,
+                            vout: index as u32,
+                            value,
                         }),
                     )
                 });
 
             // Index funding/spending history entries and spend edges
             for (scripthash, entry) in funding.chain(spending) {
-                self.history
-                    .entry(scripthash)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
+                self.history.entry(scripthash).or_default().push(entry);
             }
             for (i, txi) in tx.input.iter().enumerate() {
                 self.edges.insert(txi.previous_output, (txid, i as u32));

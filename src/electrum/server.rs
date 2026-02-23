@@ -99,6 +99,21 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
     }
 }
 
+#[repr(i16)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonRpcV2Error {
+    ParseError = -32700,
+    InvalidRequest = -32600,
+    MethodNotFound = -32601,
+    InternalError = -32603,
+}
+impl JsonRpcV2Error {
+    #[inline]
+    fn into_i16(self) -> i16 {
+        self as i16
+    }
+}
+
 struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
@@ -189,7 +204,7 @@ impl Connection {
             .chain_err(|| "discovery is disabled")?;
 
         let features = params
-            .get(0)
+            .first()
             .chain_err(|| "missing features param")?
             .clone();
         let features = serde_json::from_value(features).chain_err(|| "invalid features")?;
@@ -203,7 +218,7 @@ impl Connection {
     }
 
     fn blockchain_block_header(&self, params: &[Value]) -> Result<Value> {
-        let height = usize_from_value(params.get(0), "height")?;
+        let height = usize_from_value(params.first(), "height")?;
         let cp_height = usize_from_value_or(params.get(1), "cp_height", 0)?;
 
         let raw_header_hex: String = self
@@ -226,7 +241,7 @@ impl Connection {
     }
 
     fn blockchain_block_headers(&self, params: &[Value]) -> Result<Value> {
-        let start_height = usize_from_value(params.get(0), "start_height")?;
+        let start_height = usize_from_value(params.first(), "start_height")?;
         let count = MAX_HEADERS.min(usize_from_value(params.get(1), "count")?);
         let cp_height = usize_from_value_or(params.get(2), "cp_height", 0)?;
         let heights: Vec<usize> = (start_height..(start_height + count)).collect();
@@ -261,7 +276,7 @@ impl Connection {
     }
 
     fn blockchain_estimatefee(&self, params: &[Value]) -> Result<Value> {
-        let conf_target = usize_from_value(params.get(0), "blocks_count")?;
+        let conf_target = usize_from_value(params.first(), "blocks_count")?;
         let fee_rate = self
             .query
             .estimate_fee(conf_target as u16)
@@ -277,7 +292,7 @@ impl Connection {
     }
 
     fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
 
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
         let status_hash = get_status_hash(history_txids, &self.query)
@@ -293,9 +308,19 @@ impl Connection {
         Ok(status_hash)
     }
 
+    fn blockchain_scripthash_unsubscribe(&mut self, params: &[Value]) -> Result<Value> {
+        let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
+
+        let removed = self.status_hashes.remove(&script_hash).is_some();
+        if removed {
+            self.stats.subscriptions.dec();
+        }
+        Ok(Value::Bool(removed))
+    }
+
     #[cfg(not(feature = "liquid"))]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
         let (chain_stats, mempool_stats) = self.query.stats(&script_hash[..]);
 
         Ok(json!({
@@ -305,7 +330,7 @@ impl Connection {
     }
 
     fn blockchain_scripthash_get_history(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
 
         Ok(json!(history_txids
@@ -323,7 +348,7 @@ impl Connection {
     }
 
     fn blockchain_scripthash_listunspent(&self, params: &[Value]) -> Result<Value> {
-        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+        let script_hash = hash_from_value(params.first()).chain_err(|| "bad script_hash")?;
         let utxos = self.query.utxo(&script_hash[..])?;
 
         let to_json = |utxo: Utxo| {
@@ -351,7 +376,7 @@ impl Connection {
     }
 
     fn blockchain_transaction_broadcast(&self, params: &[Value]) -> Result<Value> {
-        let tx = params.get(0).chain_err(|| "missing tx")?;
+        let tx = params.first().chain_err(|| "missing tx")?;
         let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
         let txid = self.query.broadcast_raw(&tx)?;
         if let Err(e) = self.chan.sender().try_send(Message::PeriodicUpdate) {
@@ -361,7 +386,7 @@ impl Connection {
     }
 
     fn blockchain_transaction_get(&self, params: &[Value]) -> Result<Value> {
-        let tx_hash = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
+        let tx_hash = Txid::from(hash_from_value(params.first()).chain_err(|| "bad tx_hash")?);
         let verbose = match params.get(1) {
             Some(value) => value.as_bool().chain_err(|| "non-bool verbose value")?,
             None => false,
@@ -380,7 +405,7 @@ impl Connection {
     }
 
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
-        let txid = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
+        let txid = Txid::from(hash_from_value(params.first()).chain_err(|| "bad tx_hash")?);
         let height = usize_from_value(params.get(1), "height")?;
         let blockid = self
             .query
@@ -399,7 +424,7 @@ impl Connection {
     }
 
     fn blockchain_transaction_id_from_pos(&self, params: &[Value]) -> Result<Value> {
-        let height = usize_from_value(params.get(0), "height")?;
+        let height = usize_from_value(params.first(), "height")?;
         let tx_pos = usize_from_value(params.get(1), "tx_pos")?;
         let want_merkle = bool_from_value_or(params.get(2), "merkle", false)?;
 
@@ -431,6 +456,7 @@ impl Connection {
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(params),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(params),
+            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(params),
             "blockchain.transaction.get" => self.blockchain_transaction_get(params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(params),
@@ -447,7 +473,14 @@ impl Connection {
             #[cfg(feature = "electrum-discovery")]
             "server.add_peer" => self.server_add_peer(params),
 
-            &_ => bail!("unknown method {} {:?}", method, params),
+            &_ => {
+                warn!("rpc unknown method #{} {} {:?}", id, method, params);
+                return Ok(json_rpc_error(
+                    format!("Method {method} not found"),
+                    Some(id),
+                    JsonRpcV2Error::MethodNotFound,
+                ));
+            }
         };
         timer.observe_duration();
         // TODO: return application errors should be sent to the client
@@ -461,7 +494,7 @@ impl Connection {
                     params,
                     e.display_chain()
                 );
-                json!({"jsonrpc": "2.0", "id": id, "error": format!("{}", e)})
+                json_rpc_error(e, Some(id), JsonRpcV2Error::InternalError)
             }
         })
     }
@@ -513,7 +546,6 @@ impl Connection {
     }
 
     fn handle_replies(&mut self, shutdown: crossbeam_channel::Receiver<()>) -> Result<()> {
-        let empty_params = json!([]);
         loop {
             crossbeam_channel::select! {
                 recv(self.chan.receiver()) -> msg => {
@@ -521,18 +553,8 @@ impl Connection {
                     trace!("RPC {:?}", msg);
                     match msg {
                         Message::Request(line) => {
-                            let cmd: Value = from_str(&line).chain_err(|| "invalid JSON format")?;
-                            let reply = match (
-                                cmd.get("method"),
-                                cmd.get("params").unwrap_or(&empty_params),
-                                cmd.get("id"),
-                            ) {
-                                (Some(Value::String(method)), Value::Array(params), Some(id)) => {
-                                    self.handle_command(method, params, id)?
-                                }
-                                _ => bail!("invalid command: {}", cmd),
-                            };
-                            self.send_values(&[reply])?
+                            let result = self.handle_line(&line);
+                            self.send_values(&[result])?
                         }
                         Message::PeriodicUpdate => {
                             let values = self
@@ -551,6 +573,50 @@ impl Connection {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn handle_line(&mut self, line: &String) -> Value {
+        if let Ok(json_value) = from_str(line) {
+            match json_value {
+                Value::Array(mut arr) => {
+                    for cmd in &mut arr {
+                        // Replace each cmd with its response in-memory.
+                        *cmd = self.handle_value(cmd);
+                    }
+                    Value::Array(arr)
+                }
+                cmd => self.handle_value(&cmd),
+            }
+        } else {
+            // serde_json was unable to parse
+            json_rpc_error(
+                format!("Invalid JSON: {line}"),
+                None,
+                JsonRpcV2Error::ParseError,
+            )
+        }
+    }
+
+    #[inline]
+    fn handle_value(&mut self, value: &Value) -> Value {
+        match (
+            value.get("method"),
+            value.get("params").unwrap_or(&json!([])),
+            value.get("id"),
+        ) {
+            (Some(Value::String(method)), Value::Array(params), Some(id)) => self
+                .handle_command(method, params, id)
+                .unwrap_or_else(|err| {
+                    json_rpc_error(
+                        format!("{method} RPC error: {err}"),
+                        Some(id),
+                        JsonRpcV2Error::InternalError,
+                    )
+                }),
+            (_, _, Some(id)) => json_rpc_error(value, Some(id), JsonRpcV2Error::InvalidRequest),
+            _ => json_rpc_error(value, None, JsonRpcV2Error::InvalidRequest),
         }
     }
 
@@ -627,6 +693,25 @@ impl Connection {
             error!("[{}] receiver failed: {}", addr, err);
         }
     }
+}
+
+#[inline]
+fn json_rpc_error(
+    input: impl core::fmt::Display,
+    id: Option<&Value>,
+    code: JsonRpcV2Error,
+) -> Value {
+    let mut ret = json!({
+        "error": {
+            "code": code.into_i16(),
+            "message": format!("{input}")
+        },
+        "jsonrpc": "2.0"
+    });
+    if let (Some(id), Some(obj)) = (id, ret.as_object_mut()) {
+        obj.insert(String::from("id"), id.clone());
+    }
+    ret
 }
 
 fn get_history(

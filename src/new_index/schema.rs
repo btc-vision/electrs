@@ -1,6 +1,7 @@
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
-use bitcoin::util::merkleblock::MerkleBlock;
+use bitcoin::merkle_tree::MerkleBlock;
+#[cfg(not(feature = "liquid"))]
 use bitcoin::VarInt;
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use bitcoin::consensus::encode::{deserialize, serialize};
 #[cfg(feature = "liquid")]
 use elements::{
-    encode::{deserialize, serialize},
+    encode::{deserialize, serialize, VarInt},
     AssetId,
 };
 
@@ -20,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::chain::{
-    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
+    BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, TxidCompat, Value,
 };
 use crate::config::Config;
 use crate::daemon::Daemon;
@@ -36,6 +37,8 @@ use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
 use crate::elements::{asset, peg};
+
+use super::{db::ReverseScanGroupIterator, fetch::bitcoind_sequential_fetcher};
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
@@ -207,6 +210,22 @@ pub struct ChainQuery {
     network: Network,
 }
 
+#[derive(Debug, Clone)]
+pub enum Operation {
+    AddBlocks,
+    DeleteBlocks,
+    DeleteBlocksWithHistory(crossbeam_channel::Sender<[u8; 32]>),
+}
+
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Operation::AddBlocks => "Adding",
+            Operation::DeleteBlocks | Operation::DeleteBlocksWithHistory(_) => "Deleting",
+        })
+    }
+}
+
 // TODO: &[Block] should be an iterator / a queue.
 impl Indexer {
     pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
@@ -266,10 +285,74 @@ impl Indexer {
         Ok(result)
     }
 
+    fn reorg(&self, reorged: Vec<HeaderEntry>, daemon: &Daemon) -> Result<()> {
+        if reorged.len() > 10 {
+            warn!(
+                "reorg of over 10 blocks ({}) detected! Wonky stuff might happen!",
+                reorged.len()
+            );
+        }
+        // This channel holds a Vec of [u8; 32] scripts found in the blocks (with duplicates)
+        // if we reorg the whole mainnet chain it should come out to about 145 GB of memory.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        // Delete history_db
+        bitcoind_sequential_fetcher(daemon, reorged.clone())?
+            .map(|blocks| self.index(&blocks, Operation::DeleteBlocksWithHistory(tx.clone())));
+        // Delete txstore
+        bitcoind_sequential_fetcher(daemon, reorged)?
+            .map(|blocks| self.add(&blocks, Operation::DeleteBlocks));
+        // All senders must be dropped for receiver iterator to finish
+        drop(tx);
+
+        // All senders are dropped by now, so the receiver will iterate until the
+        // end of the unbounded queue.
+        let scripts = rx.into_iter().collect::<HashSet<_>>();
+        for script in scripts {
+            // cancel the script cache DB for these scripts. They might get incorrect data mixed in.
+            self.store.cache_db.delete(vec![
+                StatsCacheRow::key(&script),
+                UtxoCacheRow::key(&script),
+                #[cfg(feature = "liquid")]
+                [b"z", &script[..]].concat(), // asset cache key
+            ]);
+        }
+        Ok(())
+    }
+
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
         let new_headers = self.get_new_headers(&daemon, &tip)?;
+
+        // Must rollback blocks before rolling forward
+        let headers_len = {
+            let mut headers = self.store.indexed_headers.write().unwrap();
+            let (reorged, rollback_tip) = headers.apply(new_headers.clone());
+            assert_eq!(tip, *headers.tip());
+            let headers_len = headers.len();
+            drop(headers);
+
+            if !reorged.is_empty() {
+                // We should rollback the tip blockhash first in case something crashes during rollback
+                // or before the next block appears and sets the new tip.
+                match rollback_tip {
+                    Some(rb_tip) => {
+                        debug!("updating reorged tip to {:?}", rb_tip);
+                        self.store.txstore_db.put_sync(b"t", &serialize(&rb_tip));
+                    }
+                    None => {
+                        // This should only happen on regtest or some weird networks.
+                        error!("Rollback to genesis block detected!!! (rollback to height 0)");
+                        // There is no tip anymore.
+                        self.store.txstore_db.delete(vec![b"t".into()]);
+                    }
+                }
+
+                self.reorg(reorged, &daemon)?;
+            }
+
+            headers_len
+        };
 
         let to_add = self.headers_to_add(&new_headers);
         debug!(
@@ -277,7 +360,8 @@ impl Indexer {
             to_add.len(),
             self.from
         );
-        start_fetcher(self.from, &daemon, to_add)?.map(|blocks| self.add(&blocks));
+        start_fetcher(self.from, &daemon, to_add)?
+            .map(|blocks| self.add(&blocks, Operation::AddBlocks));
         self.start_auto_compactions(&self.store.txstore_db);
 
         let to_index = self.headers_to_index(&new_headers);
@@ -286,7 +370,8 @@ impl Indexer {
             to_index.len(),
             self.from
         );
-        start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
+        start_fetcher(self.from, &daemon, to_index)?
+            .map(|blocks| self.index(&blocks, Operation::AddBlocks));
         self.start_auto_compactions(&self.store.history_db);
 
         if let DBFlush::Disable = self.flush {
@@ -300,65 +385,91 @@ impl Indexer {
         debug!("updating synced tip to {:?}", tip);
         self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
-        let mut headers = self.store.indexed_headers.write().unwrap();
-        headers.apply(new_headers);
-        assert_eq!(tip, *headers.tip());
-
         if let FetchFrom::BlkFiles = self.from {
             self.from = FetchFrom::Bitcoind;
         }
 
-        self.tip_metric.set(headers.len() as i64 - 1);
+        self.tip_metric.set(headers_len as i64 - 1);
 
         Ok(tip)
     }
 
-    fn add(&self, blocks: &[BlockEntry]) {
-        debug!("Adding {} blocks to Indexer", blocks.len());
+    fn add(&self, blocks: &[BlockEntry], op: Operation) {
+        debug!("{} {} blocks to Indexer", op, blocks.len());
+        let write_label = match &op {
+            Operation::AddBlocks => "add_write",
+            _ => "delete_write",
+        };
+
         // TODO: skip orphaned blocks?
         let rows = {
             let _timer = self.start_timer("add_process");
             add_blocks(blocks, &self.iconfig)
         };
         {
-            let _timer = self.start_timer("add_write");
-            self.store.txstore_db.write(rows, self.flush);
+            let _timer = self.start_timer(write_label);
+            if let Operation::AddBlocks = op {
+                self.store.txstore_db.write(rows, self.flush);
+            } else {
+                self.store
+                    .txstore_db
+                    .delete(rows.into_iter().map(|r| r.key).collect());
+            }
         }
 
-        self.store
-            .added_blockhashes
-            .write()
-            .unwrap()
-            .extend(blocks.iter().map(|b| {
-                if b.entry.height() % 10_000 == 0 {
-                    info!("Tx indexing is up to height={}", b.entry.height());
-                }
-                b.entry.hash()
-            }));
+        if let Operation::AddBlocks = op {
+            self.store
+                .added_blockhashes
+                .write()
+                .unwrap()
+                .extend(blocks.iter().map(|b| {
+                    if b.entry.height() % 10_000 == 0 {
+                        info!("Tx indexing is up to height={}", b.entry.height());
+                    }
+                    b.entry.hash()
+                }));
+        } else {
+            let mut added_blockhashes = self.store.added_blockhashes.write().unwrap();
+            for b in blocks {
+                added_blockhashes.remove(b.entry.hash());
+            }
+        }
     }
 
-    fn index(&self, blocks: &[BlockEntry]) {
-        debug!("Indexing {} blocks with Indexer", blocks.len());
+    fn index(&self, blocks: &[BlockEntry], op: Operation) {
+        debug!("Indexing ({}) {} blocks with Indexer", op, blocks.len());
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            if matches!(op, Operation::AddBlocks) {
+                lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            } else {
+                lookup_txos_sequential(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            }
         };
         let rows = {
             let _timer = self.start_timer("index_process");
-            let added_blockhashes = self.store.added_blockhashes.read().unwrap();
-            for b in blocks {
-                if b.entry.height() % 10_000 == 0 {
-                    info!("History indexing is up to height={}", b.entry.height());
-                }
-                let blockhash = b.entry.hash();
-                // TODO: replace by lookup into txstore_db?
-                if !added_blockhashes.contains(blockhash) {
-                    panic!("cannot index block {} (missing from store)", blockhash);
+            if let Operation::AddBlocks = op {
+                let added_blockhashes = self.store.added_blockhashes.read().unwrap();
+                for b in blocks {
+                    if b.entry.height() % 10_000 == 0 {
+                        info!("History indexing is up to height={}", b.entry.height());
+                    }
+                    let blockhash = b.entry.hash();
+                    // TODO: replace by lookup into txstore_db?
+                    if !added_blockhashes.contains(blockhash) {
+                        panic!("cannot index block {} (missing from store)", blockhash);
+                    }
                 }
             }
-            index_blocks(blocks, &previous_txos_map, &self.iconfig)
+            index_blocks(blocks, &previous_txos_map, &self.iconfig, &op)
         };
-        self.store.history_db.write(rows, self.flush);
+        if let Operation::AddBlocks = op {
+            self.store.history_db.write(rows, self.flush);
+        } else {
+            self.store
+                .history_db
+                .delete(rows.into_iter().map(|r| r.key).collect());
+        }
     }
 }
 
@@ -499,58 +610,78 @@ impl ChainQuery {
         })
     }
 
-    pub fn history_iter_scan(&self, code: u8, hash: &[u8], start_height: usize) -> ScanIterator {
+    pub fn history_iter_scan(
+        &self,
+        code: u8,
+        hash: &[u8],
+        start_height: usize,
+    ) -> ScanIterator<'_> {
         self.store.history_db.iter_scan_from(
             &TxHistoryRow::filter(code, hash),
             &TxHistoryRow::prefix_height(code, hash, start_height as u32),
         )
     }
-    fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
-        self.store.history_db.iter_scan_reverse(
-            &TxHistoryRow::filter(code, hash),
-            &TxHistoryRow::prefix_end(code, hash),
-        )
-    }
-
-    pub fn summary(
-        &self,
-        scripthash: &[u8],
-        last_seen_txid: Option<&Txid>,
-        limit: usize,
-    ) -> Vec<TxHistorySummary> {
-        // scripthash lookup
-        self._summary(b'H', scripthash, last_seen_txid, limit)
-    }
-
-    fn _summary(
+    fn history_iter_scan_reverse(
         &self,
         code: u8,
         hash: &[u8],
+        start_height: Option<u32>,
+    ) -> ReverseScanIterator<'_> {
+        self.store.history_db.iter_scan_reverse(
+            &TxHistoryRow::filter(code, hash),
+            &start_height.map_or(TxHistoryRow::prefix_end(code, hash), |start_height| {
+                TxHistoryRow::prefix_height_end(code, hash, start_height)
+            }),
+        )
+    }
+    fn history_iter_scan_group_reverse(
+        &self,
+        code: u8,
+        hashes: &[[u8; 32]],
+        start_height: Option<u32>,
+    ) -> ReverseScanGroupIterator<'_> {
+        self.store.history_db.iter_scan_group_reverse(
+            hashes.iter().map(|hash| {
+                let prefix = TxHistoryRow::filter(code, &hash[..]);
+                let prefix_max = start_height
+                    .map_or(TxHistoryRow::prefix_end(code, &hash[..]), |start_height| {
+                        TxHistoryRow::prefix_height_end(code, &hash[..], start_height)
+                    });
+                (prefix, prefix_max)
+            }),
+            33,
+        )
+    }
+
+    fn collate_summaries(
+        &self,
+        iter: impl Iterator<Item = TxHistoryRow>,
         last_seen_txid: Option<&Txid>,
         limit: usize,
     ) -> Vec<TxHistorySummary> {
-        let _timer_scan = self.start_timer("address_summary");
-        let rows = self
-            .history_iter_scan_reverse(code, hash)
-            .map(TxHistoryRow::from_row)
+        // collate utxo funding/spending events by transaction
+
+        let rows = iter
             .map(|row| (row.get_txid(), row.key.txinfo, row.key.tx_position))
+            // We should make sure that each history entry should be unique
+            // We check uniqueness against equality of these 3 things:
+            // ("current txid", "the position in the inputs or outputs", "whether it's an input or output")
+            .unique_by(|(txid, info, _)| (*txid, info.get_vin_or_vout(), info.has_vin()))
             .skip_while(|(txid, _, _)| {
                 // skip until we reach the last_seen_txid
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
+                last_seen_txid.is_some_and(|last_seen_txid| last_seen_txid != txid)
             })
             .skip_while(|(txid, _, _)| {
                 // skip the last_seen_txid itself
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid == txid)
+                last_seen_txid == Some(txid)
             })
             .filter_map(|(txid, info, tx_position)| {
                 self.tx_confirming_block(&txid)
                     .map(|b| (txid, info, b.height, b.time, tx_position))
             });
-
-        // collate utxo funding/spending events by transaction
         let mut map: HashMap<Txid, TxHistorySummary> = HashMap::new();
         for (txid, info, height, time, tx_position) in rows {
-            if !map.contains_key(&txid) && map.len() == limit {
+            if !map.contains_key(&txid) && map.len() >= limit {
                 break;
             }
             match info {
@@ -606,7 +737,6 @@ impl ChainQuery {
                 _ => {}
             }
         }
-
         let mut tx_summaries = map.into_values().collect::<Vec<TxHistorySummary>>();
         tx_summaries.sort_by(|a, b| {
             if a.height == b.height {
@@ -622,54 +752,96 @@ impl ChainQuery {
         tx_summaries
     }
 
-    pub fn history(
+    pub fn summary(
         &self,
         scripthash: &[u8],
         last_seen_txid: Option<&Txid>,
+        start_height: Option<u32>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
+    ) -> Vec<TxHistorySummary> {
         // scripthash lookup
-        self._history(b'H', scripthash, last_seen_txid, limit)
+        self._summary(b'H', scripthash, last_seen_txid, start_height, limit)
     }
 
-    pub fn history_txids_iter<'a>(&'a self, scripthash: &[u8]) -> impl Iterator<Item = Txid> + 'a {
-        self.history_iter_scan_reverse(b'H', scripthash)
-            .map(|row| TxHistoryRow::from_row(row).get_txid())
-            .unique()
-    }
-
-    fn _history(
+    fn _summary(
         &self,
         code: u8,
         hash: &[u8],
         last_seen_txid: Option<&Txid>,
+        start_height: Option<u32>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
-        let _timer_scan = self.start_timer("history");
-        let txs_conf = self
-            .history_iter_scan_reverse(code, hash)
-            .map(|row| TxHistoryRow::from_row(row).get_txid())
-            // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
-            .unique()
-            // TODO seek directly to last seen tx without reading earlier rows
-            .skip_while(|txid| {
-                // skip until we reach the last_seen_txid
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
-            })
-            .skip(match last_seen_txid {
-                Some(_) => 1, // skip the last_seen_txid itself
-                None => 0,
-            })
-            .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
-            .take(limit)
-            .collect::<Vec<(Txid, BlockId)>>();
+    ) -> Vec<TxHistorySummary> {
+        let _timer_scan = self.start_timer("address_summary");
+        let rows = self
+            .history_iter_scan_reverse(code, hash, start_height)
+            .map(TxHistoryRow::from_row);
 
-        self.lookup_txns(&txs_conf)
-            .expect("failed looking up txs in history index")
-            .into_iter()
-            .zip(txs_conf)
-            .map(|(tx, (_, blockid))| (tx, blockid))
-            .collect()
+        self.collate_summaries(rows, last_seen_txid, limit)
+    }
+
+    pub fn summary_group(
+        &self,
+        scripthashes: &[[u8; 32]],
+        last_seen_txid: Option<&Txid>,
+        start_height: Option<u32>,
+        limit: usize,
+    ) -> Vec<TxHistorySummary> {
+        // scripthash lookup
+        let _timer_scan = self.start_timer("address_group_summary");
+        let rows = self
+            .history_iter_scan_group_reverse(b'H', scripthashes, start_height)
+            .map(TxHistoryRow::from_row);
+
+        self.collate_summaries(rows, last_seen_txid, limit)
+    }
+
+    pub fn history<'a>(
+        &'a self,
+        scripthash: &[u8],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<u32>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a {
+        // scripthash lookup
+        self._history(b'H', scripthash, last_seen_txid, start_height, limit)
+    }
+
+    pub fn history_txids_iter<'a>(&'a self, scripthash: &[u8]) -> impl Iterator<Item = Txid> + 'a {
+        self.history_iter_scan_reverse(b'H', scripthash, None)
+            .map(|row| TxHistoryRow::from_row(row).get_txid())
+            .unique()
+    }
+
+    fn _history<'a>(
+        &'a self,
+        code: u8,
+        hash: &[u8],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<u32>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a {
+        let _timer_scan = self.start_timer("history");
+
+        self.lookup_txns(
+            self.history_iter_scan_reverse(code, hash, start_height)
+                .map(TxHistoryRow::from_row)
+                // XXX: unique_by() requires keeping an in-memory list of all txids, can we avoid that?
+                .unique_by(|row| row.get_txid())
+                // TODO seek directly to last seen tx without reading earlier rows
+                .skip_while(move |row| {
+                    // skip until we reach the last_seen_txid
+                    last_seen_txid.is_some_and(|last_seen_txid| last_seen_txid != &row.get_txid())
+                })
+                .skip(match last_seen_txid {
+                    Some(_) => 1, // skip the last_seen_txid itself
+                    None => 0,
+                })
+                .filter_map(move |row| {
+                    self.tx_confirming_block(&row.get_txid())
+                        .map(|b| (row.get_txid(), b, row.get_tx_position()))
+                }),
+            limit,
+        )
     }
 
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
@@ -685,6 +857,60 @@ impl ChainQuery {
             .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
             .take(limit)
             .collect()
+    }
+
+    pub fn history_group<'a>(
+        &'a self,
+        scripthashes: &[[u8; 32]],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<u32>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a {
+        // scripthash lookup
+        self._history_group(b'H', scripthashes, last_seen_txid, start_height, limit)
+    }
+
+    pub fn history_txids_iter_group(
+        &self,
+        scripthashes: &[[u8; 32]],
+        start_height: Option<u32>,
+    ) -> impl Iterator<Item = Txid> + '_ {
+        self.history_iter_scan_group_reverse(b'H', scripthashes, start_height)
+            .map(|row| TxHistoryRow::from_row(row).get_txid())
+            .unique()
+    }
+
+    fn _history_group<'a>(
+        &'a self,
+        code: u8,
+        hashes: &[[u8; 32]],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<u32>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a {
+        debug!("limit {} | last_seen {:?}", limit, last_seen_txid);
+        let _timer_scan = self.start_timer("history_group");
+
+        self.lookup_txns(
+            self.history_iter_scan_group_reverse(code, hashes, start_height)
+                .map(TxHistoryRow::from_row)
+                // XXX: unique_by() requires keeping an in-memory list of all txids, can we avoid that?
+                .unique_by(|row| row.get_txid())
+                .skip_while(move |row| {
+                    // we already seeked to the last txid at this height
+                    // now skip just past the last_seen_txid itself
+                    last_seen_txid.is_some_and(|last_seen_txid| last_seen_txid != &row.get_txid())
+                })
+                .skip(match last_seen_txid {
+                    Some(_) => 1, // skip the last_seen_txid itself
+                    None => 0,
+                })
+                .filter_map(move |row| {
+                    self.tx_confirming_block(&row.get_txid())
+                        .map(|b| (row.get_txid(), b, row.get_tx_position()))
+                }),
+            limit,
+        )
     }
 
     // TODO: avoid duplication with stats/stats_delta?
@@ -983,22 +1209,32 @@ impl ChainQuery {
 
     // TODO: can we pass txids as a "generic iterable"?
     // TODO: should also use a custom ThreadPoolBuilder?
-    pub fn lookup_txns(&self, txids: &[(Txid, BlockId)]) -> Result<Vec<Transaction>> {
-        let _timer = self.start_timer("lookup_txns");
+    pub fn lookup_txns<'a, I>(
+        &'a self,
+        txids: I,
+        take: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a
+    where
+        I: Iterator<Item = (Txid, BlockId, u16)> + Send + rayon::iter::ParallelBridge + 'a,
+    {
         txids
-            .par_iter()
-            .map(|(txid, blockid)| {
-                self.lookup_txn(txid, Some(&blockid.hash))
-                    .chain_err(|| "missing tx")
+            .take(take)
+            .par_bridge()
+            .map(move |(txid, blockid, tx_position)| -> Result<_> {
+                Ok((
+                    self.lookup_txn(&txid, Some(&blockid.hash))
+                        .chain_err(|| "missing tx")?,
+                    blockid,
+                    tx_position,
+                ))
             })
-            .collect::<Result<Vec<Transaction>>>()
     }
 
     pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
         let _timer = self.start_timer("lookup_txn");
         self.lookup_raw_txn(txid, blockhash).map(|rawtx| {
             let txn: Transaction = deserialize(&rawtx).expect("failed to parse Transaction");
-            assert_eq!(*txid, txn.txid());
+            assert_eq!(*txid, txn.get_txid());
             txn
         })
     }
@@ -1046,7 +1282,7 @@ impl ChainQuery {
                 let txid: Txid = deserialize(&edge.key.spending_txid).unwrap();
                 self.tx_confirming_block(&txid).map(|b| SpendingInput {
                     txid,
-                    vin: edge.key.spending_vin as u32,
+                    vin: edge.key.spending_vin,
                     confirmed: Some(b),
                 })
             })
@@ -1102,13 +1338,19 @@ impl ChainQuery {
     }
 
     #[cfg(feature = "liquid")]
-    pub fn asset_history(
-        &self,
-        asset_id: &AssetId,
-        last_seen_txid: Option<&Txid>,
+    pub fn asset_history<'a>(
+        &'a self,
+        asset_id: &'a AssetId,
+        last_seen_txid: Option<&'a Txid>,
         limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
-        self._history(b'I', &asset_id.into_inner()[..], last_seen_txid, limit)
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId, u16)>> + 'a {
+        self._history(
+            b'I',
+            &asset_id.into_inner()[..],
+            last_seen_txid,
+            None,
+            limit,
+        )
     }
 
     #[cfg(feature = "liquid")]
@@ -1149,7 +1391,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .map(|b| {
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
-            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.txid()).collect();
+            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.get_txid()).collect();
             for tx in &b.block.txdata {
                 add_transaction(tx, blockhash, &mut rows, iconfig);
             }
@@ -1179,7 +1421,7 @@ fn add_transaction(
         rows.push(TxRow::new(tx).into_row());
     }
 
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&tx.get_txid()[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) {
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
@@ -1223,6 +1465,7 @@ fn lookup_txos(
         }
     };
     pool.install(|| {
+        // Should match lookup_txos_sequential
         outpoints
             .par_iter()
             .filter_map(|outpoint| {
@@ -1239,6 +1482,27 @@ fn lookup_txos(
     })
 }
 
+fn lookup_txos_sequential(
+    txstore_db: &DB,
+    outpoints: &BTreeSet<OutPoint>,
+    allow_missing: bool,
+) -> HashMap<OutPoint, TxOut> {
+    // Should match lookup_txos
+    outpoints
+        .iter()
+        .filter_map(|outpoint| {
+            lookup_txo(txstore_db, outpoint)
+                .or_else(|| {
+                    if !allow_missing {
+                        panic!("missing txo {} in {:?}", outpoint, txstore_db);
+                    }
+                    None
+                })
+                .map(|txo| (*outpoint, txo))
+        })
+        .collect()
+}
+
 fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
     txstore_db
         .get(&TxOutRow::key(outpoint))
@@ -1249,6 +1513,7 @@ fn index_blocks(
     block_entries: &[BlockEntry],
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     iconfig: &IndexerConfig,
+    op: &Operation,
 ) -> Vec<DBRow> {
     block_entries
         .par_iter() // serialization is CPU-intensive
@@ -1263,6 +1528,7 @@ fn index_blocks(
                     previous_txos_map,
                     &mut rows,
                     iconfig,
+                    op,
                 );
             }
             rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
@@ -1280,25 +1546,36 @@ fn index_transaction(
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
+    op: &Operation,
 ) {
     // persist history index:
     //      H{funding-scripthash}{spending-height}{spending-block-pos}S{spending-txid:vin}{funding-txid:vout} → ""
     //      H{funding-scripthash}{funding-height}{funding-block-pos}F{funding-txid:vout} → ""
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&tx.get_txid()[..]);
+    let script_callback = |script_hash| {
+        if let Operation::DeleteBlocksWithHistory(tx) = op {
+            tx.send(script_hash).expect("unbounded channel won't fail");
+        }
+    };
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) || iconfig.index_unspendables {
+            #[cfg(not(feature = "liquid"))]
+            let value = txo.value.to_sat();
+            #[cfg(feature = "liquid")]
+            let value = txo.value;
             let history = TxHistoryRow::new(
                 &txo.script_pubkey,
                 confirmed_height,
                 tx_position,
                 TxHistoryInfo::Funding(FundingInfo {
                     txid,
-                    vout: txo_index as u16,
-                    value: txo.value,
+                    vout: txo_index as u32,
+                    value,
                 }),
             );
+            script_callback(history.key.hash);
             rows.push(history.into_row());
 
             if iconfig.address_search {
@@ -1316,25 +1593,31 @@ fn index_transaction(
             .get(&txi.previous_output)
             .unwrap_or_else(|| panic!("missing previous txo {}", txi.previous_output));
 
+        #[cfg(not(feature = "liquid"))]
+        let prev_value = prev_txo.value.to_sat();
+        #[cfg(feature = "liquid")]
+        let prev_value = prev_txo.value;
+
         let history = TxHistoryRow::new(
             &prev_txo.script_pubkey,
             confirmed_height,
             tx_position,
             TxHistoryInfo::Spending(SpendingInfo {
                 txid,
-                vin: txi_index as u16,
+                vin: txi_index as u32,
                 prev_txid: full_hash(&txi.previous_output.txid[..]),
-                prev_vout: txi.previous_output.vout as u16,
-                value: prev_txo.value,
+                prev_vout: txi.previous_output.vout,
+                value: prev_value,
             }),
         );
+        script_callback(history.key.hash);
         rows.push(history.into_row());
 
         let edge = TxEdgeRow::new(
             full_hash(&txi.previous_output.txid[..]),
-            txi.previous_output.vout as u16,
+            txi.previous_output.vout,
             txid,
-            txi_index as u16,
+            txi_index as u32,
         );
         rows.push(edge.into_row());
     }
@@ -1348,6 +1631,7 @@ fn index_transaction(
         iconfig.network,
         iconfig.parent_network,
         rows,
+        op,
     );
 }
 
@@ -1390,7 +1674,7 @@ struct TxRow {
 
 impl TxRow {
     fn new(txn: &Transaction) -> TxRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.get_txid()[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),
@@ -1423,7 +1707,7 @@ struct TxConfRow {
 
 impl TxConfRow {
     fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.get_txid()[..]);
         TxConfRow {
             key: TxConfKey {
                 code: b'C',
@@ -1455,7 +1739,7 @@ impl TxConfRow {
 struct TxOutKey {
     code: u8,
     txid: FullHash,
-    vout: u16,
+    vout: u32,
 }
 
 struct TxOutRow {
@@ -1469,7 +1753,7 @@ impl TxOutRow {
             key: TxOutKey {
                 code: b'O',
                 txid: *txid,
-                vout: vout as u16,
+                vout: vout as u32,
             },
             value: serialize(txout),
         }
@@ -1478,7 +1762,7 @@ impl TxOutRow {
         bincode_util::serialize_little(&TxOutKey {
             code: b'O',
             txid: full_hash(&outpoint.txid[..]),
-            vout: outpoint.vout as u16,
+            vout: outpoint.vout,
         })
         .unwrap()
     }
@@ -1569,7 +1853,7 @@ impl BlockRow {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct FundingInfo {
     pub txid: FullHash,
-    pub vout: u16,
+    pub vout: u32,
     pub value: Value,
 }
 
@@ -1577,9 +1861,9 @@ pub struct FundingInfo {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct SpendingInfo {
     pub txid: FullHash, // spending transaction
-    pub vin: u16,
+    pub vin: u32,
     pub prev_txid: FullHash, // funding transaction
-    pub prev_vout: u16,
+    pub prev_vout: u32,
     pub value: Value,
 }
 
@@ -1615,6 +1899,31 @@ impl TxHistoryInfo {
             | TxHistoryInfo::Pegout(peg::PegoutInfo { txid, .. }) => deserialize(txid),
         }
         .expect("cannot parse Txid")
+    }
+
+    pub fn get_vin_or_vout(&self) -> u32 {
+        match self {
+            TxHistoryInfo::Funding(FundingInfo { vout: val, .. })
+            | TxHistoryInfo::Spending(SpendingInfo { vin: val, .. }) => *val,
+
+            #[cfg(feature = "liquid")]
+            TxHistoryInfo::Issuing(asset::IssuingInfo { vin: val, .. })
+            | TxHistoryInfo::Burning(asset::BurningInfo { vout: val, .. })
+            | TxHistoryInfo::Pegin(peg::PeginInfo { vin: val, .. })
+            | TxHistoryInfo::Pegout(peg::PegoutInfo { vout: val, .. }) => *val,
+        }
+    }
+
+    pub fn has_vin(&self) -> bool {
+        match self {
+            TxHistoryInfo::Funding(_) => false,
+            TxHistoryInfo::Spending(_) => true,
+
+            #[cfg(feature = "liquid")]
+            TxHistoryInfo::Issuing(_) | TxHistoryInfo::Pegin(_) => true,
+            #[cfg(feature = "liquid")]
+            TxHistoryInfo::Burning(_) | TxHistoryInfo::Pegout(_) => false,
+        }
     }
 }
 
@@ -1654,11 +1963,17 @@ impl TxHistoryRow {
     }
 
     fn prefix_end(code: u8, hash: &[u8]) -> Bytes {
-        bincode_util::serialize_big(&(code, full_hash(hash), std::u32::MAX)).unwrap()
+        bincode_util::serialize_big(&(code, full_hash(hash), u32::MAX)).unwrap()
     }
 
     fn prefix_height(code: u8, hash: &[u8], height: u32) -> Bytes {
         bincode_util::serialize_big(&(code, full_hash(hash), height)).unwrap()
+    }
+
+    // prefix representing the end of a given block (used for reverse scans)
+    fn prefix_height_end(code: u8, hash: &[u8], height: u32) -> Bytes {
+        // u16::MAX for the tx_position ensures we get all transactions at this height
+        bincode_util::serialize_big(&(code, full_hash(hash), height, u16::MAX)).unwrap()
     }
 
     pub fn into_row(self) -> DBRow {
@@ -1677,6 +1992,11 @@ impl TxHistoryRow {
     pub fn get_txid(&self) -> Txid {
         self.key.txinfo.get_txid()
     }
+
+    pub fn get_tx_position(&self) -> u16 {
+        self.key.tx_position
+    }
+
     fn get_funded_outpoint(&self) -> OutPoint {
         self.key.txinfo.get_funded_outpoint()
     }
@@ -1689,11 +2009,11 @@ impl TxHistoryInfo {
         match self {
             TxHistoryInfo::Funding(ref info) => OutPoint {
                 txid: deserialize(&info.txid).unwrap(),
-                vout: info.vout as u32,
+                vout: info.vout,
             },
             TxHistoryInfo::Spending(ref info) => OutPoint {
                 txid: deserialize(&info.prev_txid).unwrap(),
-                vout: info.prev_vout as u32,
+                vout: info.prev_vout,
             },
             #[cfg(feature = "liquid")]
             TxHistoryInfo::Issuing(_)
@@ -1717,9 +2037,9 @@ pub struct TxHistorySummary {
 struct TxEdgeKey {
     code: u8,
     funding_txid: FullHash,
-    funding_vout: u16,
+    funding_vout: u32,
     spending_txid: FullHash,
-    spending_vin: u16,
+    spending_vin: u32,
 }
 
 struct TxEdgeRow {
@@ -1729,9 +2049,9 @@ struct TxEdgeRow {
 impl TxEdgeRow {
     fn new(
         funding_txid: FullHash,
-        funding_vout: u16,
+        funding_vout: u32,
         spending_txid: FullHash,
-        spending_vin: u16,
+        spending_vin: u32,
     ) -> Self {
         let key = TxEdgeKey {
             code: b'S',
@@ -1745,7 +2065,7 @@ impl TxEdgeRow {
 
     fn filter(outpoint: &OutPoint) -> Bytes {
         // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
-        bincode_util::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
+        bincode_util::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout))
             .unwrap()
     }
 
@@ -1884,7 +2204,7 @@ mod tests {
                 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                 // vout
-                0, 3,
+                0, 0, 0, 3,
                 // Value variant (Explicit)
                 0, 0, 0, 0, 0, 0, 0, 2,
                 // number of tuple elements
@@ -1901,7 +2221,7 @@ mod tests {
                 0, 0, 0, 1,
                 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                0, 3,
+                0, 0, 0, 3,
                 // Value variant (Null)
                 0, 0, 0, 0, 0, 0, 0, 1,
                 // number of tuple elements
@@ -1916,10 +2236,10 @@ mod tests {
                 0, 0, 0, 0,
                 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
                     18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
-                0, 12,
+                0, 0, 0, 12,
                 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102,
                     98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102,
-                0, 9,
+                0, 0, 0, 9,
                 0, 0, 0, 0, 0, 0, 0, 2,
                 1,
                 14, 0, 0, 0, 0, 0, 0, 0,
@@ -1933,10 +2253,10 @@ mod tests {
                 0, 0, 0, 0,
                 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
                     18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
-                0, 12,
+                0, 0, 0, 12,
                 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102,
                     98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102, 98, 101, 101, 102,
-                0, 9,
+                0, 0, 0, 9,
                 0, 0, 0, 0, 0, 0, 0, 1,
                 0,
             ],
