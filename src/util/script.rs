@@ -110,10 +110,14 @@ impl ScriptToAddr for bitcoin::Script {
         match network {
             Network::OpnetTestnet => {
                 use bitcoin::address::Address;
-                let hrp = bitcoin::bech32::Hrp::parse_unchecked("opt");
-                Address::from_script(self, bitcoin::address::KnownHrp::from(hrp))
+                let addr = Address::from_script(self, bitcoin::Network::Signet)
                     .ok()
-                    .map(|s| s.to_string())
+                    .map(|a| a.to_string())?;
+                if let Some(stripped) = addr.strip_prefix("tb1") {
+                    Some(format!("opt1{}", stripped))
+                } else {
+                    Some(addr)
+                }
             }
             _ => {
                 bitcoin::Address::from_script(self, bitcoin::Network::from(network))
