@@ -368,6 +368,8 @@ impl Config {
             Network::Signet => 38332,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet4 => 48332,
+            #[cfg(not(feature = "liquid"))]
+            Network::OpnetTestnet => 48336,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 7041,
@@ -385,6 +387,8 @@ impl Config {
             Network::Regtest => 60401,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 60601,
+            #[cfg(not(feature = "liquid"))]
+            Network::OpnetTestnet => 60601,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 51000,
@@ -404,6 +408,8 @@ impl Config {
             Network::Signet => 3003,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet4 => 3004,
+            #[cfg(not(feature = "liquid"))]
+            Network::OpnetTestnet => 3005,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 3000,
@@ -423,6 +429,8 @@ impl Config {
             Network::Testnet4 => 44224,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 54224,
+            #[cfg(not(feature = "liquid"))]
+            Network::OpnetTestnet => 64224,
 
             #[cfg(feature = "liquid")]
             Network::Liquid => 34224,
@@ -475,6 +483,8 @@ impl Config {
             Network::Regtest => daemon_dir.push("regtest"),
             #[cfg(not(feature = "liquid"))]
             Network::Signet => daemon_dir.push("signet"),
+            #[cfg(not(feature = "liquid"))]
+            Network::OpnetTestnet => daemon_dir.push("opnet-testnet"),
 
             #[cfg(feature = "liquid")]
             Network::Liquid => daemon_dir.push("liquidv1"),
