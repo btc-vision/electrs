@@ -2023,11 +2023,37 @@ fn to_scripthash(
 fn address_to_scripthash(addr: &str, network: Network) -> Result<FullHash, HttpError> {
     #[cfg(not(feature = "liquid"))]
     let addr = {
+        // Handle custom bech32 HRP for OpnetTestnet
+        if matches!(network, Network::OpnetTestnet) && (addr.starts_with("opt1") || addr.starts_with("OPT1")) {
+            use bitcoin::bech32::Hrp;
+            use bitcoin::bech32::segwit;
+            use bitcoin::bech32::primitives::gf32::Fe32;
+
+            let (hrp, version, program) = segwit::decode(addr)
+                .map_err(|_| HttpError::from("Invalid bech32 address".to_string()))?;
+
+            if hrp != Hrp::parse_unchecked("opt") {
+                return Err(HttpError::from("Address on invalid network".to_string()));
+            }
+
+            let mut script_bytes = Vec::with_capacity(program.len() + 2);
+            // witness version opcode: v0 = OP_0 (0x00), v1-v16 = OP_1..OP_16 (0x51..0x60)
+            if version == Fe32::Q {
+                script_bytes.push(0x00);
+            } else {
+                script_bytes.push(0x50 + version.to_u8());
+            }
+            // push opcode for program length
+            script_bytes.push(program.len() as u8);
+            script_bytes.extend_from_slice(&program);
+
+            let script = bitcoin::ScriptBuf::from(script_bytes);
+            return Ok(compute_script_hash(&script));
+        }
+
         use bitcoin::address::NetworkUnchecked;
         let unchecked: bitcoin::Address<NetworkUnchecked> = addr.parse()?;
         let bnetwork = bitcoin::Network::from(network);
-        // Testnet, Regtest and Signet all share the same version bytes,
-        // so we need to allow require_network to succeed for all testnet-family networks
         let testnet_family = [
             bitcoin::Network::Testnet,
             bitcoin::Network::Regtest,
@@ -2035,7 +2061,6 @@ fn address_to_scripthash(addr: &str, network: Network) -> Result<FullHash, HttpE
             bitcoin::Network::Testnet4,
         ];
         if testnet_family.contains(&bnetwork) {
-            // Try each testnet-family network
             testnet_family
                 .iter()
                 .find_map(|&net| unchecked.clone().require_network(net).ok())
